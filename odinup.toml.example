@@ -1,0 +1,25 @@
+# odinup.toml — pin the exact toolchain for this project.
+# Copy to odinup.toml (or .odinup.toml) in your project root and commit.
+# `odinup install` reads this file (walks up from cwd), clones each repo
+# at the pinned rev/tag and builds from source into ~/.odinup/.
+
+[toolchain]
+# Odin compiler tag — must match `odin version` output (dev-YYYY-MM[a])
+odin = "dev-2026-07"
+# Optional: override Odin git URL (default: https://github.com/odin-lang/Odin)
+# git = "https://github.com/odin-lang/Odin"
+
+[tools.ols]
+# OLS (Odin Language Server) — https://github.com/DanielGavin/ols
+git = "https://github.com/DanielGavin/ols"
+# Pin a tag, branch, or sha. Empty = the tag matching the Odin pin if the
+# tool has one (ols does), else the latest default branch.
+rev = ""
+# Optional: explicit build command, run in the repo with ~/.odinup/bin on PATH.
+# Must produce ./<name> (auto-detected otherwise: build.sh / build.bat / odin build .)
+# build = ""
+
+# Add more tools in the same shape:
+# [tools.mytool]
+# git = "https://github.com/you/mytool"
+# rev = "a1b2c3d"

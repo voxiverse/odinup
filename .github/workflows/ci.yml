@@ -1,0 +1,123 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# Each job bootstraps from scratch the way a user would (piped script, no
+# checkout-relative paths), then proves the result works: compile and run a
+# program, install a project toolchain with ols, talk LSP to ols through its
+# shim, and re-run everything to check it's idempotent.
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: shellcheck install.sh
+      - name: install.ps1 parses and is pure ASCII
+        shell: pwsh
+        run: |
+          $errors = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile("$PWD/install.ps1", [ref]$null, [ref]$errors)
+          if ($errors) { $errors; exit 1 }
+          if ([IO.File]::ReadAllBytes("$PWD/install.ps1") | Where-Object { $_ -gt 127 }) { throw "install.ps1 must be ASCII (PS 5.1 reads it as cp1252)" }
+
+  unix:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    env:
+      ODINUP_REPO: ${{ github.workspace }}
+      ODINUP_REF: ${{ github.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - name: Bootstrap (curl | sh style)
+        run: sh < install.sh
+      - name: Re-run bootstrap (must be a fast no-op)
+        run: sh < install.sh
+      - name: Unit tests
+        run: ~/.odinup/odin/odin test src -vet -strict-style
+      - name: Use it
+        run: |
+          export PATH="$HOME/.odinup/bin:$PATH"
+          odinup version
+          mkdir -p "$RUNNER_TEMP/hello" && cd "$RUNNER_TEMP/hello"
+          printf 'package hello\nimport "core:fmt"\nmain :: proc() { fmt.println("hello from odin") }\n' > hello.odin
+          odin run .
+          mkdir -p "$RUNNER_TEMP/proj" && cd "$RUNNER_TEMP/proj"
+          printf '[toolchain]\nodin = "%s"\n\n[tools.ols]\ngit = "https://github.com/DanielGavin/ols"\n' \
+            "$(git -C ~/.odinup/odin describe --tags --exact-match)" > odinup.toml
+          odinup check && exit 1 || true   # ols not installed yet: must fail
+          odinup install
+          odinup check
+          odinup install                   # no-op
+          python3 "$GITHUB_WORKSPACE/.github/scripts/lsp_smoke.py"
+
+  windows:
+    strategy:
+      fail-fast: false
+      matrix:
+        # portable: what a machine without Visual Studio gets (forced here,
+        # since the runner has VS). vs: an installed Visual Studio.
+        msvc: [portable, vs]
+    name: windows (${{ matrix.msvc }})
+    runs-on: windows-latest
+    timeout-minutes: 60
+    env:
+      ODINUP_REPO: ${{ github.workspace }}
+      ODINUP_REF: ${{ github.sha }}
+      ODINUP_MSVC: ${{ matrix.msvc }}
+      ODINUP_ACCEPT_MSVC_LICENSE: "1"
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - name: Bootstrap (irm | iex style, Windows PowerShell 5.1)
+        shell: powershell
+        run: Get-Content -Raw install.ps1 | Invoke-Expression
+      - name: Re-run bootstrap (must be a fast no-op)
+        shell: powershell
+        run: Get-Content -Raw install.ps1 | Invoke-Expression
+      - name: Portable MSVC is what odin uses
+        if: matrix.msvc == 'portable'
+        shell: pwsh
+        run: |
+          $msvc = "$env:USERPROFILE\.odinup\msvc"
+          Get-Content "$msvc\env.txt"
+          if (-not (Select-String -Quiet -SimpleMatch "VCToolsInstallDir=$msvc" "$env:USERPROFILE\.odinup\bin\odin.shim")) { throw "odin shim lacks the portable MSVC environment" }
+          cmd /d /c "call `"$msvc\setup.bat`" && where cl && where link"
+          if ($LASTEXITCODE) { exit 1 }
+      - name: Unit tests
+        shell: pwsh
+        run: '& "$env:USERPROFILE\.odinup\bin\odin.exe" test src -vet -strict-style'
+      - name: odin.exe shim works from batch files without `call`
+        shell: cmd
+        run: |
+          set PATH=%USERPROFILE%\.odinup\bin;%PATH%
+          odin version || exit /b 1
+          > t.bat echo @echo off
+          >> t.bat echo odin version
+          >> t.bat echo echo AFTER-ODIN
+          call t.bat | findstr AFTER-ODIN || exit /b 1
+      - name: Use it
+        shell: pwsh
+        run: |
+          $env:PATH = "$env:USERPROFILE\.odinup\bin;$env:PATH"
+          odinup version
+          $hello = New-Item -ItemType Directory -Force "$env:RUNNER_TEMP\hello"
+          Set-Content "$hello\hello.odin" "package hello`nimport `"core:fmt`"`nmain :: proc() { fmt.println(`"hello from odin`") }"
+          Push-Location $hello; odin run .; if ($LASTEXITCODE) { exit 1 }; Pop-Location
+          $proj = New-Item -ItemType Directory -Force "$env:RUNNER_TEMP\proj"
+          $tag = git -C "$env:USERPROFILE\.odinup\odin" describe --tags --exact-match
+          Set-Content "$proj\odinup.toml" "[toolchain]`nodin = `"$tag`"`n`n[tools.ols]`ngit = `"https://github.com/DanielGavin/ols`"`n"
+          Push-Location $proj
+          odinup check; if (-not $LASTEXITCODE) { throw "check should fail before ols is installed" }
+          odinup install; if ($LASTEXITCODE) { exit 1 }
+          odinup check;   if ($LASTEXITCODE) { exit 1 }
+          odinup install; if ($LASTEXITCODE) { exit 1 }
+          python "$env:GITHUB_WORKSPACE\.github\scripts\lsp_smoke.py"; if ($LASTEXITCODE) { exit 1 }

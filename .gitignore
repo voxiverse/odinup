@@ -1,0 +1,5 @@
+# Odin build output
+*.exe
+*.pdb
+/odinup
+/src/odinup
