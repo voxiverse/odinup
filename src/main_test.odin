@@ -96,6 +96,11 @@ test_parse_config :: proc(t: ^testing.T) {
 	testing.expect_value(t, cfg.tools[0].name, "ols")
 	testing.expect_value(t, cfg.tools[0].rev, "")
 	testing.expect_value(t, cfg.tools[0].build, "make")
+	testing.expect(t, !cfg.tools[0].dev)
+
+	dev, dev_errs := parse_config("[toolchain]\nodin = \"dev-2026-10\"\n[tools.ols]\ndev = true\n")
+	testing.expect_value(t, len(dev_errs), 0)
+	testing.expect(t, len(dev.tools) == 1 && dev.tools[0].dev)
 }
 
 @(test)
@@ -109,6 +114,7 @@ test_parse_config_rejects_mistakes :: proc(t: ^testing.T) {
 		"[odin]\nversion = \"x\"\n",           // unknown section
 		"odin = \"x\"\n",                      // outside a section
 		"[toolchain]\nodin \"x\"\n",           // not key = value
+		"[tools.ols]\ndev = yes\n",              // dev is true or false
 	}
 	for text in cases {
 		_, errs := parse_config(text)

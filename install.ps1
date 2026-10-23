@@ -3,7 +3,8 @@
 #   powershell -NoProfile -ExecutionPolicy Bypass -Command "irm https://raw.githubusercontent.com/voxiverse/odinup/main/install.ps1 | iex"
 #
 # What it does (each step is skipped when already done, so re-running is safe):
-#   1. git: uses yours, else downloads portable MinGit to ~\.odinup\git (no admin).
+#   1. git: uses yours, else installs Git for Windows with winget (it includes
+#      Git LFS, which Odin's repository uses for some vendor libraries).
 #   2. MSVC: uses an installed Visual Studio with the C++ tools, else downloads
 #      just the compiler + Windows SDK from Microsoft into ~\.odinup\msvc
 #      ("portable MSVC": no Visual Studio installer, no admin, no UAC prompt).
@@ -54,6 +55,32 @@ function Invoke-Checked {
     if ($LASTEXITCODE -ne 0) { Die "'$exe $($rest -join ' ')' failed (exit $LASTEXITCODE)" }
 }
 
+# Update-SessionPath adds new entries from the registry PATH (machine, then
+# user) to this session's, so programs installed by this script (winget) are
+# usable right away; entries only this session has are kept.
+function Update-SessionPath {
+    $have = @($env:PATH -split ";" | Where-Object { $_ })
+    foreach ($scope in "Machine", "User") {
+        foreach ($p in ([Environment]::GetEnvironmentVariable("Path", $scope) -split ";")) {
+            if ($p -and $have -notcontains $p) { $have += $p }
+        }
+    }
+    $env:PATH = $have -join ";"
+}
+
+# Remove-FromUserPath drops $dir from the user PATH (registry and session).
+function Remove-FromUserPath($dir) {
+    $env:PATH = (($env:PATH -split ";") | Where-Object { $_ -and $_ -ne $dir }) -join ";"
+    $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey("Environment", $true)
+    try {
+        $cur = $key.GetValue("Path", "", [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+        $parts = @($cur -split ";" | Where-Object { $_ -and $_ -ne $dir })
+        if ($parts.Count -ne @($cur -split ";" | Where-Object { $_ }).Count) {
+            $key.SetValue("Path", ($parts -join ";"), [Microsoft.Win32.RegistryValueKind]::ExpandString)
+        }
+    } finally { $key.Close() }
+}
+
 # Add-ToUserPath persists $dir in the user PATH (registry, keeping
 # REG_EXPAND_SZ so %VARS% in existing entries survive) and this session.
 function Add-ToUserPath($dir) {
@@ -72,6 +99,26 @@ function Add-ToUserPath($dir) {
     Ok "Added $dir to your user PATH"
 }
 
+# QuickEdit: with it on (the default), clicking in the console starts a
+# selection that freezes all output until a key is pressed - a finished
+# build then looks hung. Off while we run; put back at the end.
+$quickEdit = $null
+try {
+    if (-not ([System.Management.Automation.PSTypeName]'OdinupConsole.Native').Type) {
+        Add-Type -Namespace OdinupConsole -Name Native -MemberDefinition @'
+[DllImport("kernel32.dll")] public static extern System.IntPtr GetStdHandle(int n);
+[DllImport("kernel32.dll")] public static extern bool GetConsoleMode(System.IntPtr h, out uint m);
+[DllImport("kernel32.dll")] public static extern bool SetConsoleMode(System.IntPtr h, uint m);
+'@
+    }
+    $stdin = [OdinupConsole.Native]::GetStdHandle(-10)
+    $mode = [uint32]0
+    if ([OdinupConsole.Native]::GetConsoleMode($stdin, [ref]$mode)) {
+        $off = ($mode -band [uint32]4294967231) -bor [uint32]128   # clear QUICK_EDIT (0x40), set EXTENDED_FLAGS (0x80)
+        if ([OdinupConsole.Native]::SetConsoleMode($stdin, $off)) { $quickEdit = $mode }
+    }
+} catch { }
+
 # ---------------------------------------------------------------- platform
 $arch = if ($env:PROCESSOR_ARCHITEW6432) { $env:PROCESSOR_ARCHITEW6432 } else { $env:PROCESSOR_ARCHITECTURE }
 if ($arch -ne "AMD64") { Warn "This machine is $arch; odinup is tested on x64 (AMD64) Windows only." }
@@ -79,25 +126,34 @@ Log "odinup bootstrap (Windows $([Environment]::OSVersion.Version), PowerShell $
 New-Item -ItemType Directory -Force -Path $DestDir, $BinDir, $StateDir | Out-Null
 
 # --------------------------------------------------------------------- git
-if (Get-Command git -ErrorAction SilentlyContinue) {
-    Ok "git: $((Get-Command git).Source)"
-} else {
-    $gitDir = Join-Path $DestDir "git"
-    $gitCmd = Join-Path $gitDir "cmd"
-    if (-not (Test-Path (Join-Path $gitCmd "git.exe"))) {
-        Log "git not found - downloading portable MinGit (no admin needed)"
-        $rel = Invoke-RestMethod -UseBasicParsing -Uri "https://api.github.com/repos/git-for-windows/git/releases/latest" -Headers @{ "User-Agent" = "odinup" }
-        $asset = $rel.assets | Where-Object { $_.name -match '^MinGit-[\d.]+-64-bit\.zip$' } | Select-Object -First 1
-        if (-not $asset) { Die "Could not find a MinGit download. Install Git for Windows (https://git-scm.com/download/win) and re-run." }
-        $zip = Join-Path $env:TEMP $asset.name
-        Invoke-WebRequest -UseBasicParsing -Uri $asset.browser_download_url -OutFile $zip
-        if (Test-Path $gitDir) { Remove-Item -Recurse -Force $gitDir }
-        Expand-Archive -Path $zip -DestinationPath $gitDir -Force
-        Remove-Item -Force $zip
+# Git for Windows (includes Git LFS: Odin keeps some vendor libraries in it),
+# installed with winget when there is no git. odinup 1.0 used a portable
+# MinGit without Git LFS, which breaks Odin's checkout: retire it.
+$oldMinGit = Join-Path $DestDir "git"
+$oldMinGitCmd = Join-Path $oldMinGit "cmd"
+Remove-FromUserPath $oldMinGitCmd
+if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
+    if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
+        Die "Git is not installed and winget is not available. Install Git for Windows from https://git-scm.com/download/win, then re-run this installer."
     }
-    Add-ToUserPath $gitCmd
-    Ok "git: $gitCmd\git.exe"
+    Log "Installing Git for Windows with winget..."
+    $wingetArgs = @("install", "--id", "Git.Git", "--exact", "--source", "winget", "--accept-package-agreements", "--accept-source-agreements", "--disable-interactivity")
+    & winget @wingetArgs --scope user
+    Update-SessionPath
+    if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
+        # No per-user installer on this machine: install for all users (Windows asks to confirm).
+        & winget @wingetArgs
+        Update-SessionPath
+    }
+    if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
+        Die "Installing Git with winget did not work (see above). Install Git for Windows from https://git-scm.com/download/win, then re-run this installer."
+    }
 }
+Ok "git: $((Get-Command git).Source)"
+# Through cmd: redirecting a native command's stderr in PS 5.1 can throw.
+& cmd.exe /d /c "git lfs version >nul 2>nul"
+if ($LASTEXITCODE -eq 0) { Ok "git-lfs present" } else { Warn "git-lfs is missing: Odin's vendor:box2d/box3d will lack their libraries (Git for Windows includes it)" }
+if (Test-Path $oldMinGit) { Remove-Item -Recurse -Force $oldMinGit -ErrorAction SilentlyContinue }
 
 # -------------------------------------------------------------------- MSVC
 # Odin needs Microsoft's compiler to build itself and Microsoft's linker,
@@ -347,6 +403,9 @@ foreach ($k in $msvcVars.Keys) {
 try {
 
 # -------------------------------------------------------------------- Odin
+# LFS files are checked out as pointers whatever the git; `odinup install`
+# then fetches the real ones (git lfs pull).
+$NoLfs = @("-c", "filter.lfs.smudge=", "-c", "filter.lfs.process=", "-c", "filter.lfs.required=false")
 if (Test-Path (Join-Path $OdinDir ".git")) {
     Log "Fetching Odin updates"
     & git -C $OdinDir fetch --tags --force --prune origin
@@ -354,7 +413,7 @@ if (Test-Path (Join-Path $OdinDir ".git")) {
 } else {
     if (Test-Path $OdinDir) { Remove-Item -Recurse -Force $OdinDir }
     Log "Cloning Odin..."
-    Invoke-Checked git clone $OdinRepo $OdinDir
+    Invoke-Checked git @NoLfs clone $OdinRepo $OdinDir
 }
 
 $tag = $env:ODINUP_ODIN_VERSION
@@ -365,7 +424,7 @@ if (-not $tag) {
 Log "Odin $tag"
 $want = & git -C $OdinDir rev-parse --verify --quiet "$tag^{commit}"
 if ($LASTEXITCODE -ne 0 -or -not $want) { Die "Odin tag '$tag' not found." }
-Invoke-Checked git -C $OdinDir checkout --quiet --force --detach $want
+Invoke-Checked git -C $OdinDir @NoLfs checkout --quiet --force --detach $want
 
 # Skip the multi-minute build when this commit is already built.
 $built = $false
@@ -431,9 +490,10 @@ Write-Host ""
 Write-Host "  This window is ready to use. Other open terminals need a restart"
 Write-Host "  (Windows Terminal: close all of its windows)."
 Write-Host ""
-Write-Host "  In a project with an odinup.toml:  odinup install"
+Write-Host "  In a project with an odinup.toml:  odinup install   (--dev: also its dev tools, e.g. ols)"
 if ($msvcVars.Count) {
     Write-Host "  To compile C code with MSVC (cl, link):  call %USERPROFILE%\.odinup\msvc\setup.bat"
 }
 Write-Host ""
+if ($null -ne $quickEdit) { [void][OdinupConsole.Native]::SetConsoleMode([OdinupConsole.Native]::GetStdHandle(-10), $quickEdit) }
 }

@@ -158,3 +158,30 @@ run_cmd_script :: proc(script, cwd: string, env: []string = nil) -> bool {
 	defer os.remove(bat)
 	return run({"cmd.exe", "/d", "/c", bat}, cwd, env)
 }
+
+// ---------------------------------------------------------------------------
+// Console QuickEdit
+// ---------------------------------------------------------------------------
+//
+// With QuickEdit on (the default), clicking in a console window starts a
+// selection that freezes the program's output until a key is pressed; during
+// a long build that looks exactly like a hang. Builds turn it off and put the
+// console back as it was afterwards.
+
+ENABLE_EXTENDED_FLAGS :: 0x0080
+
+Quick_Edit_Restore :: struct {
+	mode:  win.DWORD,
+	valid: bool,
+}
+
+quick_edit_off :: proc() -> (r: Quick_Edit_Restore) {
+	h := win.GetStdHandle(win.STD_INPUT_HANDLE)
+	if !win.GetConsoleMode(h, &r.mode) do return // not a console (redirected, CI)
+	r.valid = bool(win.SetConsoleMode(h, (r.mode & ~win.DWORD(win.ENABLE_QUICK_EDIT_MODE)) | ENABLE_EXTENDED_FLAGS))
+	return
+}
+
+quick_edit_restore :: proc(r: Quick_Edit_Restore) {
+	if r.valid do win.SetConsoleMode(win.GetStdHandle(win.STD_INPUT_HANDLE), r.mode)
+}

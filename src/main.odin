@@ -21,7 +21,7 @@ import "core:strings"
 // Pins resolve to commits in the local clones; the odin binary carries its own
 // commit, tools get a stamp in ~/.odinup/state written after a successful build.
 
-VERSION :: "1.0.0"
+VERSION :: "1.1.0"
 
 ODIN_REPO :: "https://github.com/odin-lang/Odin"
 OLS_REPO  :: "https://github.com/DanielGavin/ols"
@@ -42,6 +42,7 @@ Tool_Pin :: struct {
 	git:   string,
 	rev:   string, // tag, branch or sha; empty = tag matching the Odin pin, else default branch
 	build: string, // optional shell command; empty = build.sh/build.bat, else `odin build .`
+	dev:   bool, // a development tool (language server, formatter): only with --dev
 }
 
 // ---------------------------------------------------------------------------
@@ -207,7 +208,41 @@ ensure_clone :: proc(git_url, dest: string) -> bool {
 	if os.exists(dest) do os.remove_all(dest)
 	os.make_directory_all(filepath.dir(dest))
 	log_info(fmt.tprintf("Cloning %s ...", git_url))
-	return run({"git", "clone", git_url, dest})
+	return run({"git", NO_LFS[0], NO_LFS[1], NO_LFS[2], NO_LFS[3], NO_LFS[4], NO_LFS[5], "clone", git_url, dest})
+}
+
+// NO_LFS: check out Git LFS files as their small pointer files, whether or
+// not git-lfs is installed (some Git installs, like MinGit, fail checkouts
+// outright without it). lfs_pull then fetches the real files when it can.
+NO_LFS :: [6]string{"-c", "filter.lfs.smudge=", "-c", "filter.lfs.process=", "-c", "filter.lfs.required=false"}
+
+// lfs_pull replaces LFS pointer files with their content (Odin keeps some
+// vendor libraries, like Box2D's, in LFS). Without git-lfs it warns: only
+// those vendor packages are affected.
+lfs_pull :: proc(dest: string) {
+	attrs, err := os.read_entire_file_from_path(pjoin({dest, ".gitattributes"}), context.temp_allocator)
+	if err != nil || !strings.contains(string(attrs), "filter=lfs") do return
+	if _, has_lfs := git_out(dest, "lfs", "version"); !has_lfs {
+		log_warn(fmt.tprintf("git-lfs is not installed: %s's LFS files (e.g. vendor:box2d libraries) stay missing; install git-lfs and re-run", filepath.base(dest)))
+		return
+	}
+	// "-" marks a file still in pointer form; nothing to do (and no network) otherwise.
+	files, _ := git_out(dest, "lfs", "ls-files")
+	missing := false
+	for line in strings.split_lines(files, context.temp_allocator) {
+		parts := strings.fields(line, context.temp_allocator)
+		if len(parts) >= 2 && parts[1] == "-" do missing = true
+	}
+	if !missing do return
+	log_info(fmt.tprintf("Fetching Git LFS files for %s", filepath.base(dest)))
+	// Enable LFS for this repository, or pull leaves pointers: its filters
+	// only (no hooks), and not required, so a later git without git-lfs
+	// still works on this checkout.
+	enabled := run({"git", "lfs", "install", "--local", "--skip-repo"}, dest)
+	enabled = enabled && run({"git", "config", "--local", "filter.lfs.required", "false"}, dest)
+	if !enabled || !run({"git", "lfs", "pull"}, dest) {
+		log_warn("git lfs pull failed: LFS-backed vendor libraries may be missing")
+	}
 }
 
 fetch :: proc(dest: string) -> bool {
@@ -259,11 +294,12 @@ resolve_pin :: proc(dest, rev: string) -> (sha: string, ok: bool) {
 }
 
 checkout_commit :: proc(dest, sha: string) -> bool {
+	defer lfs_pull(dest)
 	if head, ok := git_out(dest, "rev-parse", "HEAD"); ok && head == sha {
 		return true
 	}
 	log_info(fmt.tprintf("Checking out %s in %s", sha[:12], filepath.base(dest)))
-	return run({"git", "checkout", "--quiet", "--force", "--detach", sha}, dest)
+	return run({"git", NO_LFS[0], NO_LFS[1], NO_LFS[2], NO_LFS[3], NO_LFS[4], NO_LFS[5], "checkout", "--quiet", "--force", "--detach", sha}, dest)
 }
 
 // same_commit compares a full sha against a possibly abbreviated one.
@@ -523,7 +559,13 @@ parse_config :: proc(text: string) -> (cfg: Config, errs: [dynamic]string) {
 			case "git":   t.git = value
 			case "rev":   t.rev = value
 			case "build": t.build = value
-			case: append(&errs, fmt.tprintf("line %d: unknown key '%s' in [tools.%s] (expected git, rev, build)", n, key, tool))
+			case "dev":
+				switch value {
+				case "true":  t.dev = true
+				case "false": t.dev = false
+				case: append(&errs, fmt.tprintf("line %d: dev must be true or false", n))
+				}
+			case: append(&errs, fmt.tprintf("line %d: unknown key '%s' in [tools.%s] (expected git, rev, build, dev)", n, key, tool))
 			}
 		} else if len(section) == 0 && len(errs) == 0 {
 			append(&errs, fmt.tprintf("line %d: '%s' is outside any section", n, key))
@@ -627,7 +669,13 @@ open_config :: proc(file_arg: string) -> (cfg: Config, path: string, status: Con
 
 // odin_override (--odin) replaces the config's Odin pin; the bootstrap scripts
 // use it to hand over the tag they just built.
-do_install :: proc(latest: bool, file_arg: string, odin_override := "") -> int {
+do_install :: proc(latest: bool, file_arg: string, odin_override := "", dev := false) -> int {
+	when ODIN_OS == .Windows {
+		// Clicking a console window pauses its output until a key is pressed
+		// (QuickEdit), which looks exactly like a hung build.
+		restore := quick_edit_off()
+		defer quick_edit_restore(restore)
+	}
 	cfg, path, status := open_config(file_arg)
 	switch status {
 	case .Invalid: return 1
@@ -677,8 +725,16 @@ do_install :: proc(latest: bool, file_arg: string, odin_override := "") -> int {
 
 	// ---- Tools: keep going past a failure, but fail the command.
 	result := 0
+	skipped := 0
 	for tool in cfg.tools {
+		if tool.dev && !dev {
+			skipped += 1
+			continue
+		}
 		if !install_tool(tool, target, sha, latest) do result = 1
+	}
+	if skipped > 0 {
+		log_info(fmt.tprintf("Skipped %d development tool(s); `odinup install --dev` installs them too", skipped))
 	}
 
 	ensure_path()
@@ -772,7 +828,7 @@ ensure_path :: proc() {
 
 // do_check is read-only and offline: it resolves pins against local clones and
 // compares commits. Exit 1 means `odinup install` would change something.
-do_check :: proc(file_arg: string) -> int {
+do_check :: proc(file_arg: string, dev := false) -> int {
 	cfg, path, status := open_config(file_arg)
 	switch status {
 	case .Invalid: return 1
@@ -804,6 +860,7 @@ do_check :: proc(file_arg: string) -> int {
 	}
 
 	for tool in cfg.tools {
+		if tool.dev && !dev do continue
 		dest := tool_dir(tool.name)
 		st, has_stamp := read_stamp(tool.name)
 		if !has_stamp || !os.exists(pjoin({dest, exe_name(tool.name)})) {
@@ -941,8 +998,9 @@ log_err :: proc(m: string)  { fmt.eprintfln("error: %s", m) }
 print_usage :: proc() {
 	fmt.printfln("odinup %s — Odin toolchain manager", VERSION)
 	fmt.println("Usage:")
-	fmt.println("  odinup install [--latest | --odin <tag>] [--file odinup.toml]")
-	fmt.println("  odinup check   [--file odinup.toml]")
+	fmt.println("  odinup install [--latest | --odin <tag>] [--dev] [--file odinup.toml]")
+	fmt.println("  odinup check   [--dev] [--file odinup.toml]")
+	fmt.println("  (--dev: also the tools marked dev = true, e.g. ols)")
 	fmt.println("  odinup pin <odin|tool> <value> [--file odinup.toml]")
 	fmt.println("  odinup update  [--file odinup.toml]")
 	fmt.println("  odinup version")
@@ -966,6 +1024,7 @@ main :: proc() {
 
 Args :: struct {
 	latest:     bool,
+	dev:        bool,
 	file:       string,
 	odin:       string,
 	positional: [dynamic]string,
@@ -979,6 +1038,8 @@ parse_args :: proc(args: []string, is_install: bool) -> (a: Args, ok: bool) {
 		switch {
 		case arg == "--latest" && is_install:
 			a.latest = true
+		case arg == "--dev":
+			a.dev = true
 		case arg == "--file" || arg == "-f" || (arg == "--odin" && is_install):
 			if i + 1 >= len(args) {
 				log_err(fmt.tprintf("%s needs a value", arg))
@@ -1039,8 +1100,8 @@ real_main :: proc() -> int {
 	}
 
 	switch cmd {
-	case "install": return do_install(a.latest, a.file, a.odin)
-	case "check":   return do_check(a.file)
+	case "install": return do_install(a.latest, a.file, a.odin, a.dev)
+	case "check":   return do_check(a.file, a.dev)
 	case "pin":     return do_pin(a.positional[0], a.positional[1], a.file)
 	case "update":  return do_update(a.file)
 	}

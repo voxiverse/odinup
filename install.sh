@@ -4,7 +4,7 @@
 #   curl -sSfL https://raw.githubusercontent.com/voxiverse/odinup/main/install.sh | sh
 #
 # What it does:
-#   1. Installs git, make and clang if missing (asks for sudo only then).
+#   1. Installs git, git-lfs, make and clang if missing (asks for sudo only then).
 #   2. Clones Odin into ~/.odinup/odin and builds the pinned or latest dev-* tag,
 #      first installing an LLVM version that tag supports if there isn't one.
 #   3. Builds the odinup manager with that compiler, then hands over to
@@ -145,6 +145,30 @@ ensure_base_tools() {
     ok "git, make, clang installed"
 }
 
+# ensure_git_lfs installs Git LFS if missing: Odin keeps some vendor
+# libraries (Box2D's, Box3D's) in LFS. Best effort: without it only those
+# packages are missing, so odinup warns and carries on.
+ensure_git_lfs() {
+    if git lfs version >/dev/null 2>&1; then
+        ok "git-lfs present"
+        return
+    fi
+    log "Installing git-lfs (Odin keeps some vendor libraries in Git LFS)..."
+    if [ "$OS_NAME" = Darwin ] && ! have brew; then
+        warn "git-lfs is missing and Homebrew is not installed: vendor:box2d/box3d will lack their libraries (install git-lfs and re-run)"
+        return
+    fi
+    if pkg_install git-lfs && git lfs version >/dev/null 2>&1; then
+        ok "git-lfs installed"
+    else
+        warn "could not install git-lfs: vendor:box2d/box3d will lack their libraries (install git-lfs and re-run)"
+    fi
+}
+
+# NO_LFS: clone and check out LFS files as pointers whether or not git-lfs is
+# installed; `odinup install` then fetches the real files (git lfs pull).
+NO_LFS="-c filter.lfs.smudge= -c filter.lfs.process= -c filter.lfs.required=false"
+
 # ensure_llvm installs an LLVM in Odin's supported range: the distro's default
 # when it fits, else a versioned package (rolling distros can be ahead of
 # Odin, older LTS releases behind), else apt.llvm.org on Debian/Ubuntu.
@@ -201,7 +225,8 @@ build_odin() {
         rm -rf "$ODIN_DIR"
         mkdir -p "$DEST_DIR"
         log "Cloning Odin..."
-        git clone "$ODIN_REPO" "$ODIN_DIR"
+        # shellcheck disable=SC2086 # NO_LFS is several arguments
+        git $NO_LFS clone "$ODIN_REPO" "$ODIN_DIR"
     fi
 
     ODIN_TAG="${ODINUP_ODIN_VERSION:-}"
@@ -212,7 +237,8 @@ build_odin() {
     log "Odin $ODIN_TAG"
 
     WANT="$(git -C "$ODIN_DIR" rev-parse --verify --quiet "$ODIN_TAG^{commit}")" || die "Odin tag '$ODIN_TAG' not found."
-    git -C "$ODIN_DIR" checkout --quiet --force --detach "$WANT"
+    # shellcheck disable=SC2086
+    git -C "$ODIN_DIR" $NO_LFS checkout --quiet --force --detach "$WANT"
 
     # Skip the multi-minute build when this commit is already built.
     if [ -x "$ODIN_DIR/odin" ]; then
@@ -273,6 +299,7 @@ build_odinup() {
 main() {
     log "odinup bootstrap ($OS_NAME/$(uname -m))"
     ensure_base_tools
+    ensure_git_lfs
     build_odin
     build_odinup
 

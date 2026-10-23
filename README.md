@@ -27,10 +27,12 @@ It starts from a bare machine, installs only what's missing, and is safe to re-r
 
 | | Linux / macOS | Windows |
 |---|---|---|
-| Prerequisites | git, make, clang via your package manager (apt, dnf, pacman, zypper, apk, Homebrew/Xcode CLT) — asks for `sudo` only if something is missing | git: uses yours, else portable [MinGit](https://github.com/git-for-windows/git/releases) (no admin) |
+| Prerequisites | git, git-lfs, make, clang via your package manager (apt, dnf, pacman, zypper, apk, Homebrew/Xcode CLT) — asks for `sudo` only if something is missing | git: uses yours, else installs [Git for Windows](https://gitforwindows.org) with `winget` (per user if it can, else for all users after a Windows confirmation) |
 | C/C++ toolchain | an LLVM version the Odin release supports (read from Odin's own `build_odin.sh`); falls back to versioned packages or [apt.llvm.org](https://apt.llvm.org) when the distro default is too old or too new | uses an installed Visual Studio with the C++ tools; otherwise downloads **just the MSVC compiler and Windows SDK** from Microsoft into `.odinup\msvc` — no Visual Studio installer, no admin, no UAC prompt (asks you to accept Microsoft's license first) |
 | Odin | clones to `~/.odinup/odin`, builds the latest `dev-YYYY-MM` release | same, `%USERPROFILE%\.odinup\odin` |
 | PATH | adds `~/.odinup/bin` to `.bashrc` / `.profile` / `.zshrc` (those that exist) | adds `%USERPROFILE%\.odinup\bin` to your user PATH |
+
+Odin keeps a few vendor libraries (Box2D, Box3D) in Git LFS; odinup fetches them when git-lfs is available and warns otherwise (everything else works without it).
 
 Expect a few minutes for the Odin build itself, plus the MSVC download on a Windows machine without Visual Studio.
 
@@ -62,13 +64,15 @@ odin = "dev-2026-10"          # Odin tag, branch or commit
 [tools.ols]
 git = "https://github.com/DanielGavin/ols"
 rev = ""                       # tag, branch or sha; empty = ols's tag matching the Odin release
+dev = true                     # only for working on the project: `odinup install --dev`
 ```
 
 Then anyone on the project runs:
 
 ```sh
-odinup install      # build exactly what the toml pins (no-op if already built)
-odinup check        # exit 1 if anything doesn't match; read-only, works offline
+odinup install        # build exactly what the toml pins (no-op if already built)
+odinup install --dev  # ... plus the development tools (dev = true), e.g. ols and odinfmt
+odinup check          # exit 1 if anything doesn't match; read-only, works offline
 ```
 
 A project build script can make this automatic:
@@ -81,8 +85,8 @@ odin build src -out:my_game
 ### Commands
 
 ```
-odinup install [--latest | --odin <tag>] [--file odinup.toml]
-odinup check   [--file odinup.toml]
+odinup install [--latest | --odin <tag>] [--dev] [--file odinup.toml]
+odinup check   [--dev] [--file odinup.toml]
 odinup pin <odin|tool> <value> [--file odinup.toml]
 odinup update  [--file odinup.toml]     # bump to the newest Odin release + matching tools
 odinup version
@@ -98,6 +102,7 @@ odinup version
 | `[toolchain] git` | Odin repository (default `https://github.com/odin-lang/Odin`) |
 | `[tools.<name>] git` | Tool repository (default for `ols`: DanielGavin/ols) |
 | `[tools.<name>] rev` | Tag, branch or sha. Empty: the tool's tag equal to the Odin tag if it has one (ols tags in lockstep with Odin; its default branch tracks unreleased Odin and often won't build against a release), else its default branch |
+| `[tools.<name>] dev` | `true`: a development tool (language server, formatter), installed and checked only with `--dev`, so building the project needs just the compiler |
 | `[tools.<name>] build` | Build command, run in the tool's checkout with `~/.odinup/bin` on PATH. Default: `build.sh` / `build.bat`, else `odin build .`. Must produce `./<name>` |
 
 The parser is strict on purpose: an unknown key (`ref =` instead of `rev =`) is an error rather than silently building the wrong thing.

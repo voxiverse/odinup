@@ -58,6 +58,16 @@ jobs:
           odinup check
           odinup install                   # no-op
           python3 "$GITHUB_WORKSPACE/.github/scripts/lsp_smoke.py"
+          # A dev tool is only installed with --dev.
+          mkdir -p "$RUNNER_TEMP/devproj" && cd "$RUNNER_TEMP/devproj"
+          printf '[toolchain]\nodin = "%s"\n\n[tools.devtool]\ngit = "https://github.com/DanielGavin/ols"\ndev = true\n' \
+            "$(git -C ~/.odinup/odin describe --tags --exact-match)" > odinup.toml
+          odinup install | tee out.txt
+          grep -q 'Skipped 1 development tool' out.txt
+          test ! -e ~/.odinup/devtool
+          odinup check                     # dev tools are not checked without --dev
+      - name: Git LFS files are real (not pointers)
+        run: head -c 7 ~/.odinup/odin/vendor/box3d/lib/linux-amd64/libbox3d.a | grep -q '!<arch>'
 
   windows:
     strategy:
@@ -121,3 +131,16 @@ jobs:
           odinup check;   if ($LASTEXITCODE) { exit 1 }
           odinup install; if ($LASTEXITCODE) { exit 1 }
           python "$env:GITHUB_WORKSPACE\.github\scripts\lsp_smoke.py"; if ($LASTEXITCODE) { exit 1 }
+          Pop-Location
+          # A dev tool is only installed with --dev.
+          $dev = New-Item -ItemType Directory -Force "$env:RUNNER_TEMP\devproj"
+          Set-Content "$dev\odinup.toml" "[toolchain]`nodin = `"$tag`"`n`n[tools.devtool]`ngit = `"https://github.com/DanielGavin/ols`"`ndev = true`n"
+          Push-Location $dev
+          $out = odinup install | Out-String; if ($LASTEXITCODE) { exit 1 }
+          if ($out -notmatch "Skipped 1 development tool") { throw "dev tool not skipped" }
+          if (Test-Path "$env:USERPROFILE\.odinup\devtool") { throw "dev tool installed without --dev" }
+          odinup check; if ($LASTEXITCODE) { exit 1 }
+          Pop-Location
+          # Git LFS files are real (not pointers).
+          $lib = [IO.File]::ReadAllBytes("$env:USERPROFILE\.odinup\odin\vendor\box2d\lib\box2d_windows_amd64_avx2.lib")
+          if ([Text.Encoding]::ASCII.GetString($lib, 0, 7) -ne "!<arch>") { throw "box2d library is still an LFS pointer" }
